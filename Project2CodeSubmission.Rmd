@@ -1,0 +1,490 @@
+---
+title: "Prediction of Yelp Ratings Based on Text Reviews"
+author: "Caleb Stevens, Jiayi Gao, and Ruochong Fan"
+date: "10/17/2020"
+output:
+  html_document: default
+  pdf_document: default
+subtitle: STAT 333 Project 2, Group 2
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, comment=NA, tidy=TRUE, tidy.opts=list(width.cutoff=45), warning=FALSE, message=FALSE, fig.width=6, fig.height=6, fig.align='center')
+
+library(dplyr)
+library(plyr)
+library(ggplot2)
+library(ggfortify)
+library(xtable)
+library(knitr)
+library(GGally)
+library(qqplotr)
+library(car)
+library(kableExtra)
+library(gridExtra)
+library(moonBook) 
+library(magrittr)
+library(broom)
+library(leaps)
+library(stringr)
+library(boot)
+```
+
+\newpage
+
+# Step 1: Visualizing Data
+
+```{r}
+# Import data and clean up some R formatting issues
+train_data = read.csv("train_yelp.csv", header = TRUE, stringsAsFactors = FALSE)
+test_data = read.csv("test_yelp.csv",header = TRUE, stringsAsFactors = FALSE)
+train_data[sample(nrow(train_data),1),]
+test_data[sample(nrow(test_data),1),]
+```
+
+We can start by visualizing data the relationship between several predictors and the response variable "star", which is the rating of restaurants. The goal of the project is to come up with a prediction model based on the "train_data" in order to predict yelp ratings from "test_data". Originally, the stars appear to be integers from 1 to 5 in the ratings, the prediction tends to have decimals and may also exceed the 1 - 5 limit. For the sake of accuracy, the project decides to keep all decimal places for predicted ratings.  
+
+```{r}
+p1 <- ggplot(train_data, aes(x = nWord, y = nChar)) + geom_point() + labs(x = "Number of words", y = "Number of characters") + ggtitle("Number of Words v. Number of Characters") + theme_classic()
+p2 <- ggplot(train_data, aes(star)) + geom_histogram() + theme_classic()
+grid.arrange(p1, p2, nrow = 1)
+
+# Numerically validating the relationships between character/word count and star ratings.
+for(i in 1:5) {
+  mu = round(mean(train_data[train_data$star ==i,"nWord"]),2)
+  sd = round(sd(train_data[train_data$star == i,"nWord"]),2)
+  print(paste("Star",i,": mean words =",mu,", sd =",sd))
+}
+print("####")
+for(i in 1:5) {
+  mu = round(mean(train_data[train_data$star ==i,"nChar"]),2)
+  sd = round(sd(train_data[train_data$star == i,"nChar"]),2)
+  print(paste("Star",i,": mean characters =",mu,", sd =",sd))
+}
+```
+
+From the above plot, we can see that there is a strong relationship between number of words and number of characters. From all reviews, number of five_star ratings are dominant. 
+
+```{r}
+#visualizing the overall distribution of star-ratings in our sample
+ggplot(train_data) + 
+  geom_histogram(aes(x=star),binwidth=1) + ggtitle("Stars Histogram") + theme(plot.title = element_text(hjust=0.5))
+
+#and for specific zip codes
+zip.53702.data = dplyr::filter(train_data, postalCode==53702)
+ggplot(zip.53702.data) + 
+  geom_histogram(aes(x=star),binwidth=1) + 
+  ggtitle("Zip 53702 Stars Histogram") + 
+  theme(plot.title = element_text(hjust=0.5))
+
+zip.53532.data = dplyr::filter(train_data, postalCode==53532)
+ggplot(zip.53532.data) + 
+  geom_histogram(aes(x=star),binwidth=1) + 
+  ggtitle("Zip 53532 Stars Histogram") + 
+  theme(plot.title = element_text(hjust=0.5))
+
+```
+
+
+```{r}
+# Testing the relationship between words and stars with anova
+anova(lm(log(train_data$nWord) ~ factor(train_data$star))) #Word Count ANOVA
+anova(lm(log(train_data$nChar) ~ factor(train_data$star))) #Character Count ANOVA
+```
+
+Step 2: creating our own summary variables
+```{r}
+#we wanted to experiment with adding some of our own summary statistics, so first we identified all unique words in the dataset
+all.unique = function(data.subset, debug=F) {
+  data.subset$text = gsub(pattern="[\n,\\.\\!\\?'-]", replacement=" ", x=data.subset$text)
+  data.subset$text = gsub(pattern="[][\\$\\&\\(\\)\\;\\:\\/\\*\"\\%+#~'1234567890¢°=]",replacement="",x=data.subset$text)
+  data.subset$split <- str_split(str_to_lower(data.subset$text),pattern="\\s+")
+  unique.vector <- unique(unlist(data.subset$split))
+  return(unique.vector)
+}
+unique.words <- all.unique(train_data)
+```
+
+```{r}
+#next we performed (overnight) an SLR with each unique word as predictor, excluding some common words - this function takes about 4 hours to run, so we've not included it here, only the results
+regression.test.results <- readRDS("regressionTestResults.rds")
+arranged <- arrange(regression.test.results, pvals, coefs)
+print(arranged[1:20,])
+```
+```{r}
+#we used these coefficients as 'word scores' to help produce our summary statistics
+#selecting only those word scores where p.val <= 0.01
+significance.threshold = 0.01
+significant.words <- dplyr::filter(regression.test.results, pvals <= significance.threshold)
+positive.words <- dplyr::filter(significant.words, coefs > 0)
+negative.words <- dplyr::filter(significant.words, coefs < 0)
+
+#slicing original data - first 10 columns to add construct our own summary statistics
+final.data <- train_data[,1:10]
+final.data$pos.ratio = final.data$nPosWord / final.data$nWord
+final.data$neg.ratio = final.data$nNegWord / final.data$nWord
+
+#some zipcodes are NA - set to 0 instead
+for(i in seq_len(length(final.data[[1]]))) {
+  if(is.na(final.data$postalCode[i])) {final.data$postalCode[i] = 0}
+}
+
+#add split lowercase text column to dataframe
+final.data$split = gsub(pattern="[\n,\\.\\!\\?'-]", replacement=" ", x=final.data$text)
+final.data$split = gsub(pattern="[][\\$\\&\\(\\)\\;\\:\\/\\*\"\\%+#~'1234567890¢°=]",replacement="",x=final.data$split )
+final.data$split <- str_split(str_to_lower(final.data$split),pattern="\\s+")
+
+
+#add our.pos.count, our.neg.count
+#how many words in the review are also in pos list, neg list
+
+#two functions we needed
+which.in.list = function(review.split, comparison.v) {
+  review.split <- unlist(review.split)
+  indices <- which(review.split %in% comparison.v)
+  return(indices)
+}
+count.in.list = function(review.split, comparison.v) {
+  indices <- which.in.list(review.split, comparison.v)
+  return(length(indices))
+}
+#calculating summary stats here
+final.data$our.pos.count <- sapply(final.data$split, count.in.list, positive.words$words.v)
+final.data$our.pos.ratio <- final.data$our.pos.count / final.data$nWord
+final.data$our.neg.count <- sapply(final.data$split, count.in.list, negative.words$words.v)
+final.data$our.neg.ratio <- final.data$our.neg.count / final.data$nWord
+
+
+#add coef.pos.sum, coef.pos.sum.sqrt, coef.pos.ln
+#needed more functions
+which.in.reverse = function(review.split, comparison.v) {
+  review.split <- unlist(review.split)
+  indices <- which(comparison.v %in% review.split)
+  return(indices)
+}
+coef.sum = function(review.split, comparison.df) {
+  indices <- which.in.reverse(review.split, comparison.df$words)
+  coefs <- comparison.df$coefs[indices]
+  return(sum(coefs))
+}
+#calculating summary statistics here
+final.data$coef.pos.sum = sapply(final.data$split, coef.sum, positive.words)
+final.data$coef.pos.sum.sqrt = sqrt(final.data$coef.pos.sum)
+final.data$coef.pos.sum.ln = log(final.data$coef.pos.sum + 1)
+
+#add coef.neg.sum, coef.neg.sum.sqrt, coef.pos.ln
+final.data$coef.neg.sum = sapply(final.data$split, coef.sum, negative.words)
+final.data$coef.neg.sum.sqrt = sign(final.data$coef.neg.sum)*sqrt(abs(final.data$coef.neg.sum))
+final.data$coef.neg.sum.ln = sign(final.data$coef.neg.sum)*log(abs(final.data$coef.neg.sum)+1)
+
+#add coef.overall.sum, coef.overall.sum.sqrt, coef.overall.sum.ln
+final.data$coef.overall.sum = final.data$coef.pos.sum + final.data$coef.neg.sum
+final.data$coef.overall.sum.sqrt = sign(final.data$coef.overall.sum)*sqrt(abs(final.data$coef.overall.sum))
+final.data$coef.overall.sum.ln = sign(final.data$coef.overall.sum) * log(abs(final.data$coef.overall.sum))
+
+intens.v <- c("really", "very", "so", "always", "definitely", "all","too","only", "soo", "sooo", "soooo", "sooooo", "soooooo")
+#add num.intensifiers
+#count how many intensifiers are in the review split text
+final.data$intens.count = sapply(final.data$split, count.in.list, intens.v)
+
+#find all the words that are in the two words after an intensifier
+intensifier.process = function(intens.v) {
+  to.return = c()
+  if(length(intens.v)==0) {return(NULL)}
+  for (i in intens.v) {
+    j <- i + 1
+    k <- i + 2
+    to.return = c(to.return, j, k)
+  }
+  return(to.return)
+}
+intensifier.indices = sapply(final.data$split, which.in.list, intens.v)
+after.intensifier.indices = sapply(intensifier.indices, intensifier.process)
+
+final.data$intens.pos.count = c()
+final.data$intens.neg.count = c()
+final.data$intens.pos.sum = c()
+final.data$intens.neg.sum = c()
+for (i in seq_len(length(final.data[[1]]))) {
+  after.intens.words = final.data$split[[i]][after.intensifier.indices[[i]]]
+  words.in.pos = which(after.intens.words %in% positive.words$words.v)
+  words.in.neg = which(after.intens.words %in% negative.words$words.v)
+  final.data$intens.pos.count[i] = length(words.in.pos)
+  final.data$intens.neg.count[i] = length(words.in.neg)
+  final.data$intens.pos.sum[i] = sum(positive.words$coefs[words.in.pos])
+  final.data$intens.neg.sum[i] = sum(negative.words$coefs[words.in.neg])
+}
+
+#words we found to be significant alongside our other predictors
+words <- c(" great"," best"," delicious"," always"," no "," amazing"," friendly",
+           " however"," why "," never"," horrible"," wrong"," nothing"," disappointed", 
+           " terrible"," downhill"," awful"," inedible"," tasteless"," waste"," poor", 
+           " underwhelm"," acceptable"," mediocre"," gross"," subpar"," stale"," microwave", 
+           " sick"," undercooked"," barely"," stumble"," dream"," awesome"," exceed", 
+           " phenomenal", " heaven", " over ", " her ", " perfect", " excellent", " wasn", " customer", 
+           " worst", " manager", " told", " said", " favorite", " ok ", " took", " disappointing", 
+           " money", " bland ", " even ", " worse ", " fantastic ", " slow ", " bill ", " later ", 
+           " overpriced", " dry", " better", " wonderful", " him", " okay", " arrived", " someone",
+           " maybe", " tasted", " supposed", " phone", " instead", " soggy", " flavorless ", " how ", 
+           " wouldn", " meh ", " recommend", " disappointment", " average", " burnt", " know", " gave",
+           " decent", " elsewhere", " zero", " any ", " sad", " used", " person", " orders", " gone",
+           " either", " atmosphere", " employee", " incredible", " gem", " being", " card", " less",
+           " min ", " unacceptable", " mistake", " selection", " away", " service")
+for (w in words) {
+  colName <- gsub(pattern="\\s+",replacement="",w)
+  final.data[[colName]] = str_count(final.data$text, w)
+}
+
+zips <- c(53508, 53515, 53521, 53521, 53527, 53528, 53529, 53531, 53532, 53558, 53559, 53562, 53572, 53575, 53583, 53589, 53590, 53593, 53597, 53598, 53701, 53702, 53703, 53704, 53705, 53706, 53711, 53713, 53714, 53715, 53716, 53717, 53718, 53719, 53726, 53725, 53957, 93215)
+for (z in zips) {
+  colName = paste("zip",z,"DV",sep="")
+  final.data[[colName]] = (final.data$postalCode == z)
+}
+
+```
+
+
+Section 3: our model itself
+```{r}
+
+
+yelp.lm <- lm(star ~ zip53527DV + zip53562DV + zip53575DV + zip53590DV +
+                zip53590DV + zip53597DV + zip53702DV + zip53703DV + zip53704DV + zip53705DV + zip53711DV + zip53713DV + 
+                zip53716DV + zip53717DV + zip53718DV + zip53719DV + zip93215DV +
+                nChar + nNegWord + neg.ratio + 
+                our.pos.count + our.pos.ratio + our.neg.count + coef.pos.sum + 
+                coef.pos.sum.sqrt + 
+                coef.neg.sum.ln + coef.overall.sum.sqrt + coef.overall.sum.ln + intens.count + 
+                intens.neg.count + great + best + delicious + always + no +
+                amazing + friendly + however + why + never + horrible + wrong + nothing + disappointed + 
+                terrible + downhill + awful + inedible + tasteless + waste + poor + underwhelm + acceptable + 
+                mediocre + gross + subpar + stale + microwave + sick + undercooked + barely + stumble + dream +
+                awesome + exceed + heaven + her + perfect + excellent + wasn + customer +
+                worst + manager + told + said + favorite + ok + took + disappointing + money + bland +
+                even + worse + fantastic + bill + overpriced + dry + better + wonderful + him + 
+                okay + arrived + someone + tasted + supposed + phone +
+                soggy + flavorless + how + wouldn + meh + recommend + disappointment + average + burnt +
+                know + gave + decent + elsewhere + zero + sad + used + person + orders + gone + either + atmosphere +
+                employee + incredible + gem + being + card + less + unacceptable +
+                mistake + selection + away + service + nChar:coef.overall.sum.ln + 
+                pos.ratio:neg.ratio + pos.ratio:our.neg.count + pos.ratio:coef.neg.sum.sqrt + 
+                pos.ratio:coef.overall.sum.sqrt + pos.ratio:intens.count + neg.ratio:our.neg.count + neg.ratio:coef.neg.sum.sqrt + 
+                neg.ratio:coef.overall.sum.sqrt + neg.ratio:coef.overall.sum.ln + our.pos.count:coef.neg.sum + our.pos.count:coef.neg.sum.sqrt + 
+                our.pos.count:coef.overall.sum.sqrt + our.neg.count:coef.neg.sum + our.neg.count:coef.neg.sum.sqrt + our.neg.count:coef.overall.sum.sqrt + 
+                our.neg.count:coef.overall.sum.ln + our.neg.ratio:coef.neg.sum + our.neg.ratio:coef.overall.sum.ln + 
+                coef.pos.sum:coef.neg.sum + coef.pos.sum:coef.overall.sum.sqrt + coef.pos.sum:coef.overall.sum.ln + coef.pos.sum.sqrt:coef.neg.sum + 
+                coef.pos.sum.sqrt:coef.overall.sum.sqrt + coef.pos.sum.sqrt:coef.overall.sum.ln + coef.pos.sum.ln:coef.neg.sum + 
+                coef.pos.sum.ln:coef.overall.sum.sqrt + coef.pos.sum.ln:coef.overall.sum.ln + coef.neg.sum:coef.neg.sum.sqrt + 
+                coef.neg.sum:coef.overall.sum.sqrt + coef.neg.sum:coef.overall.sum.ln + coef.neg.sum.sqrt:coef.overall.sum.sqrt + 
+                coef.neg.sum.sqrt:coef.overall.sum.ln + coef.overall.sum.sqrt:coef.overall.sum.ln
+              , data=final.data)
+summary(yelp.lm)
+
+
+
+```
+
+Lite version of model
+```{r}
+model.lite <- lm(star ~ coef.pos.sum.sqrt + coef.neg.sum.ln + neg.ratio, data=final.data)
+
+summary(model.lite)
+```
+
+mean only model
+```{r}
+yelp.lm.mean <- lm(star ~ 1, data=final.data)
+summary(yelp.lm.mean)
+```
+
+
+# Step 3: Model Selection 
+
+Selecting predictors from the new "final.data" data frame, which includes variables such as positive words ratio, variables like count of words (i.e number of time "best" appears in a text), and postal codes labeled either true or false for the clarifying the distric difference. Both forward and backward selection is included in order to increase the accuracy. We chose the result of a backwards AIC process. 
+
+
+Setting an upper limit on VIF can decrease the collinearity between predictors, but neglecting possible predictors also causes the model to loose the adjusted R-squared value. In this forward selection, the R^2 has decreased from 0.6416 to 0.5626. For the sake of accuracy prediction, the project decides to choose R^2 and compromise on collinearity. Although the 6 predictors in the end has collinearity very close to 1, this reduced model only explains 56% of the full model. 
+
+## Backward selection with words
+
+```{r}
+yelp_prediction_backward <- yelp.lm
+summary(yelp_prediction_backward)
+selectedMod <- step(yelp_prediction_backward, direction = 'backward')
+summary(selectedMod)
+all_vifs <- car::vif(selectedMod) #stepwise regression
+signif_all <- names(all_vifs)
+
+# Remove vars with VIF > 6 and re-build model until none of VIFs don't exceed 6.
+while(any(all_vifs > 6)){
+  var_with_max_vif <- names(which(all_vifs == max(all_vifs)))  # get the var with max vif
+  signif_all <- signif_all[!(signif_all) %in% var_with_max_vif]  # remove
+  myForm <- as.formula(paste("star ~ ", paste (signif_all, collapse=" + "), sep=""))  # new formula
+  selectedMod <- lm(myForm, data = final.data)  # re-build model with new formula
+  all_vifs <- car::vif(selectedMod)
+}
+summary(selectedMod)
+car::vif(selectedMod)
+```
+
+
+## Model selection on both sides with predictors from "final.data"
+
+```{r}
+dim(final.data) # Showing the number of columns: total 156 columns with 152 predictors. 
+yelp.step.both = step(yelp.lm, direction='both') #AIC selection with "both" sides. 
+summary(yelp.step.both)
+```
+
+Backwards selection from full model using BIC
+```{r}
+#backwards BIC selection:
+X= model.matrix(yelp.lm)[,-1]
+yelp.step.backward.BIC = step(yelp.lm, direction='backward', k=log(nrow(X)))
+```
+
+
+In order to do an interpretation of the model, we must find some most important predictors. We first decides to remove all words and all postal codes (the dummy variables in the model) since words-type variables generally tend to have low slope coefficients and postal codes variables tend to have large p-values in the F-test. In that case, a forward model selection is constructed only using 13 predictors based on positive or negative ratio. 
+
+```{r}
+yelp.step.forward = step(lm(star ~ 1, final.data), # Set initial model with int. only
+                             list(upper = ~ nChar + nNegWord + neg.ratio + our.pos.count + our.pos.ratio + our.neg.count + coef.pos.sum + coef.pos.sum.sqrt + coef.neg.sum.ln + coef.overall.sum.sqrt + coef.overall.sum.ln + intens.count + intens.neg.count), #Set"biggest" model to consider
+                             direction='forward', k=2) # k=2 sets the criterion to AIC
+summary(yelp.step.forward)
+```
+
+Our 'lite' model (seen above) came from this process
+
+As the final model has adjusted-R^2 of 0.6802, this reduced reduced model has adjusted-R^2 0.5988, which is a good approximation of the final model, since it only has 3 predictors. 
+
+
+# Step 4: Diagnostics
+
+Comparing models to one another using CV, BIC, AIC
+```{r}
+yelp.glm.full = glm(star ~ zip53527DV + zip53562DV + zip53575DV + zip53590DV +
+                          zip53590DV + zip53597DV + zip53702DV + zip53703DV + zip53704DV + zip53705DV + zip53711DV + zip53713DV + 
+                          zip53716DV + zip53717DV + zip53718DV + zip53719DV + zip93215DV +
+                          nChar + nNegWord + neg.ratio + 
+                          our.pos.count + our.pos.ratio + our.neg.count + coef.pos.sum + 
+                          coef.pos.sum.sqrt + 
+                          coef.neg.sum.ln + coef.overall.sum.sqrt + coef.overall.sum.ln + intens.count + 
+                          intens.neg.count + great + best + delicious + always + no +
+                          amazing + friendly + however + why + never + horrible + wrong + nothing + disappointed + 
+                          terrible + downhill + awful + inedible + tasteless + waste + poor + underwhelm + acceptable + 
+                          mediocre + gross + subpar + stale + microwave + sick + undercooked + barely + stumble + dream +
+                          awesome + exceed + heaven + her + perfect + excellent + wasn + customer +
+                          worst + manager + told + said + favorite + ok + took + disappointing + money + bland +
+                          even + worse + fantastic + bill + overpriced + dry + better + wonderful + him + 
+                          okay + arrived + someone + tasted + supposed + phone +
+                          soggy + flavorless + how + wouldn + meh + recommend + disappointment + average + burnt +
+                          know + gave + decent + elsewhere + zero + sad + used + person + orders + gone + either + atmosphere +
+                          employee + incredible + gem + being + card + less + unacceptable +
+                          mistake + selection + away + service + nChar:coef.overall.sum.ln + 
+                          pos.ratio:neg.ratio + pos.ratio:our.neg.count + pos.ratio:coef.neg.sum.sqrt + 
+                          pos.ratio:coef.overall.sum.sqrt + pos.ratio:intens.count + neg.ratio:our.neg.count + neg.ratio:coef.neg.sum.sqrt + 
+                          neg.ratio:coef.overall.sum.sqrt + neg.ratio:coef.overall.sum.ln + our.pos.count:coef.neg.sum + our.pos.count:coef.neg.sum.sqrt + 
+                          our.pos.count:coef.overall.sum.sqrt + our.neg.count:coef.neg.sum + our.neg.count:coef.neg.sum.sqrt + our.neg.count:coef.overall.sum.sqrt + 
+                          our.neg.count:coef.overall.sum.ln + our.neg.ratio:coef.neg.sum + our.neg.ratio:coef.overall.sum.ln + 
+                          coef.pos.sum:coef.neg.sum + coef.pos.sum:coef.overall.sum.sqrt + coef.pos.sum:coef.overall.sum.ln + coef.pos.sum.sqrt:coef.neg.sum + 
+                          coef.pos.sum.sqrt:coef.overall.sum.sqrt + coef.pos.sum.sqrt:coef.overall.sum.ln + coef.pos.sum.ln:coef.neg.sum + 
+                          coef.pos.sum.ln:coef.overall.sum.sqrt + coef.pos.sum.ln:coef.overall.sum.ln + coef.neg.sum:coef.neg.sum.sqrt + 
+                          coef.neg.sum:coef.overall.sum.sqrt + coef.neg.sum:coef.overall.sum.ln + coef.neg.sum.sqrt:coef.overall.sum.sqrt + 
+                          coef.neg.sum.sqrt:coef.overall.sum.ln + coef.overall.sum.sqrt:coef.overall.sum.ln
+                        , data=final.data)
+
+yelp.glm.lite = glm(star ~ coef.pos.sum.sqrt + coef.neg.sum.ln + neg.ratio, data=final.data)
+
+yelp.glm.mean = glm(star ~ 1, data=final.data)
+
+cv.glm(model.frame(yelp.glm.full), yelp.glm.full, K=5)$delta
+cv.glm(model.frame(yelp.glm.lite), yelp.glm.lite, K=5)$delta
+cv.glm(model.frame(yelp.glm.mean), yelp.glm.mean, K=5)$delta
+
+AIC(yelp.lm)
+AIC(model.lite)
+AIC(yelp.lm.mean)
+
+BIC(yelp.lm)
+BIC(model.lite)
+BIC(yelp.lm.mean)
+```
+
+
+## Checking Model Assumptions
+
+```{r}
+# Checking linearity and homoskedasticity
+yelp.lm$std.residuals = rstandard(yelp.lm)
+plot(x=1:57008, y=yelp.lm$std.residuals, xlab="residual index", ylab="standardized residuals", main="Standardized Residual Plot", cex=0.7,cex.main=2,cex.lab=2)
+abline(a=0,b=0,col="darkgreen",lwd=4)
+
+```
+
+```{r}
+#checking normality of the error term
+qqnorm(rstandard(yelp.lm), main="Normal QQ Plot for Yelp Error")
+abline(a=0, b=1, col="red")
+
+```
+
+
+Looking for outliers with leverage and cook's distance
+```{r}
+n = dim(final.data)[1]
+pii <- hatvalues(yelp.step.both); 
+plot(1:n, pii, type="p", pch = 19, cex = 1.2, cex.lab = 1.5, cex.main = 1.5,
+     xlab = "Index (Each Observation)", ylab = "Pii", main = "Leverage Values (Pii)")
+```
+
+Leverage values look reasonable with all points below or about 0.03.
+
+```{r}
+n = dim(final.data)[1]
+cooki <- cooks.distance(yelp.step.both)
+plot(1:n, cooki, type = "p", pch = 19, cex = 1.2, cex.lab = 1.5, cex.main = 1.5,
+     xlab = "Index (Each Observation)", ylab = "Cook's Distance", main = "Influential Points")
+```
+
+Cook's distance appears reasonable for all points. 
+
+Comparing our model to the full model using all predictors, we maintain the null hypothesis: the full model explains about as much variation in the data as our reduced model.
+
+ANOVA:
+
+```{r}
+#anova for full vs slightly reduced by backward AIC
+anova(yelp.lm, yelp.step.both)
+```
+
+Using ANOVA, we do not see evidence that the full model explains more of the variation seen in the data compared to our reduced model.
+
+```{r}
+#anova for full vs 'lite'
+anova(yelp.step.both, )
+```
+lite model does a somewhat worse job, but not by too much
+
+```{r}
+# Listing all VIF, although already shown in previous chunks
+vif(yelp.lm)
+vif(yelp.step.both)
+```
+
+The predictors used in our reduced model appear to have some degree of collinearity, however, much less than we observe for the full model
+
+```{r}
+#visualizing results of model
+
+plot.results = function(model.obj, debug=F) {
+  actual <- model.obj$fitted.values + model.obj$residuals
+  predict <- model.obj$fitted.values
+  comparison.df = data.frame(actual, predict)
+  print(ggplot(data=comparison.df) + facet_wrap(~actual) +
+          geom_density(aes(x=predict, y=..density..,color=actual))
+  )
+}
+plot.results(yelp.lm)
+```
